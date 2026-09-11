@@ -1,6 +1,6 @@
 /**
  * Nova Browser — server.js
- * Защита: Basic Auth для сайта + API_TOKEN для /api/*
+ * Мультидвижок: Serper #1 + Serper #2 + Tavily работают вместе.
  */
 const http = require('http');
 const fs = require('fs');
@@ -11,46 +11,57 @@ const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 
 /* ============================================
-   ЗАЩИТА
+   КЛЮЧИ (из env, с fallback на встроенные)
    ============================================ */
+const SERPER_KEY_1 = process.env.SERPER_KEY || '34e2b98552e12dafa0dcf1eb81399f3cbc435019';
+const SERPER_KEY_2 = process.env.SERPER_KEY_2 || '1025273686ebb849b608e75816420fb6a99e7e78';
+const TAVILY_KEY   = process.env.TAVILY_KEY || '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';
 
-// Basic Auth — защищает ВЕСЬ сайт (браузер попросит логин/пароль)
+/* ============================================
+   КЕШ (чтобы не жечь лимиты)
+   ============================================ */
+const CACHE_TTL = 10 * 60 * 1000; // 10 минут
+const cache = new Map();
+
+function cacheGet(key) {
+  const v = cache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.t > CACHE_TTL) { cache.delete(key); return null; }
+  return v.data;
+}
+function cacheSet(key, data) {
+  cache.set(key, { t: Date.now(), data });
+  if (cache.size > 300) {
+    const oldest = [...cache.keys()].slice(0, 100);
+    oldest.forEach(k => cache.delete(k));
+  }
+}
+
+/* ============================================
+   AUTH
+   ============================================ */
 function checkBasicAuth(req) {
   const user = process.env.SITE_USER;
   const pass = process.env.SITE_PASS;
-  if (!user || !pass) return true; // если не задано — открыто
+  if (!user || !pass) return true;
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Basic ')) return false;
   try {
     const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
     const idx = decoded.indexOf(':');
-    const u = decoded.slice(0, idx);
-    const p = decoded.slice(idx + 1);
-    return u === user && p === pass;
+    return decoded.slice(0, idx) === user && decoded.slice(idx + 1) === pass;
   } catch (e) { return false; }
 }
 
-// Проверка доступа к /api/*
-// Разрешено если:
-//   1) Есть правильный X-API-Token (для ChatClaud / других серверов)
-//   2) Прошёл Basic Auth (для Nova-фронтенда из браузера)
-//   3) Ничего не настроено (разработка)
 function checkApiAuth(req) {
   const hasToken = !!process.env.API_TOKEN;
   const hasSite = !!(process.env.SITE_USER && process.env.SITE_PASS);
-
-  // ничего не настроено — открыто
   if (!hasToken && !hasSite) return true;
-
-  // токен в заголовке
   if (hasToken) {
     const t = req.headers['x-api-token'];
     if (t && t === process.env.API_TOKEN) return true;
   }
-
-  // Basic Auth (тот же пользователь, что и сайт)
   if (hasSite && checkBasicAuth(req)) return true;
-
   return false;
 }
 
@@ -115,19 +126,15 @@ function safeJoin(root, reqPath) {
   return full;
 }
 
-/* ============ SSRF ============ */
 function isSafeUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
     if (!['http:', 'https:'].includes(u.protocol)) return false;
     const host = u.hostname.toLowerCase();
-    if (
-      host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' ||
-      host.endsWith('.local') ||
-      /^10\./.test(host) || /^192\.168\./.test(host) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-      /^169\.254\./.test(host)
-    ) return false;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' ||
+        host.endsWith('.local') ||
+        /^10\./.test(host) || /^192\.168\./.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) return false;
     return true;
   } catch (e) { return false; }
 }
@@ -159,6 +166,171 @@ function youtubeVideoId(url) {
   return m ? m[1] : null;
 }
 
+/* ============================================
+   ПОИСК: SERPER (два ключа)
+   ============================================ */
+async function serperSearch(key, query, type, gl, hl) {
+  const endpoints = {
+    search: 'https://google.serper.dev/search',
+    images: 'https://google.serper.dev/images',
+    videos: 'https://google.serper.dev/videos',
+    news: 'https://google.serper.dev/news',
+    places: 'https://google.serper.dev/places',
+    scholar: 'https://google.serper.dev/scholar'
+  };
+  const url = endpoints[type] || endpoints.search;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-API-KEY': key,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ q: query, gl: gl || 'ru', hl: hl || 'ru', num: 20 })
+    });
+    if (!r.ok) {
+      console.warn('[serper] HTTP', r.status, 'type=' + type);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.warn('[serper] fail:', e.message);
+    return null;
+  }
+}
+
+/* ============================================
+   ПОИСК: TAVILY
+   ============================================ */
+async function tavilySearch(query, depth) {
+  try {
+    const r = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: TAVILY_KEY,
+        query: query,
+        search_depth: depth || 'advanced',
+        include_answer: true,
+        include_raw_content: false,
+        max_results: 10,
+        topic: 'general'
+      })
+    });
+    if (!r.ok) {
+      console.warn('[tavily] HTTP', r.status);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.warn('[tavily] fail:', e.message);
+    return null;
+  }
+}
+
+/* ============================================
+   СЛИЯНИЕ РЕЗУЛЬТАТОВ
+   ============================================ */
+function normalizeUrl(u) {
+  try {
+    const x = new URL(u);
+    return x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/$/, '');
+  } catch (e) { return String(u || '').toLowerCase(); }
+}
+
+function mergeResults(engineResults, type) {
+  // engineResults = [{ source: 'serper1'|'serper2'|'tavily', data: {...} }]
+  const merged = [];
+  const seen = new Set();
+
+  // 1) Serper organic/videos/images/news
+  engineResults.forEach((er) => {
+    if (!er || !er.data) return;
+    const arr = er.data.organic || er.data.videos || er.data.images || er.data.news || [];
+    arr.forEach((item, idx) => {
+      const link = item.link || item.url || '';
+      const key = normalizeUrl(link);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      merged.push({
+        title: item.title || '',
+        link: link,
+        snippet: item.snippet || item.description || item.date || '',
+        source: item.source || '',
+        imageUrl: item.imageUrl || item.thumbnailUrl || '',
+        position: idx,
+        engine: er.source,
+        // ranking weight: serper1=3, serper2=2, tavily=1
+        weight: er.source === 'serper1' ? 3 : er.source === 'serper2' ? 2 : 1
+      });
+    });
+  });
+
+  // 2) Tavily answer — отдельно
+  const tavilyAnswer = engineResults.find(e => e && e.source === 'tavily');
+  const answer = tavilyAnswer && tavilyAnswer.data && tavilyAnswer.data.answer ? tavilyAnswer.data.answer : null;
+
+  // 3) Сортировка: сначала взвешенные, потом по позиции
+  merged.sort((a, b) => {
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    return a.position - b.position;
+  });
+
+  return { items: merged, answer };
+}
+
+/* ============================================
+   МУЛЬТИПОИСК — все три движка параллельно
+   ============================================ */
+async function multiSearch(query, type) {
+  const cacheKey = type + ':' + query.toLowerCase();
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    console.log('[cache hit]', cacheKey);
+    return cached;
+  }
+
+  const tasks = [];
+
+  // Serper #1 — основной
+  tasks.push(serperSearch(SERPER_KEY_1, query, type).then(d => ({ source: 'serper1', data: d })).catch(() => null));
+
+  // Serper #2 — второй ключ (тоже параллельно — больше результатов)
+  if (SERPER_KEY_2 && SERPER_KEY_2 !== SERPER_KEY_1) {
+    tasks.push(serperSearch(SERPER_KEY_2, query, type).then(d => ({ source: 'serper2', data: d })).catch(() => null));
+  }
+
+  // Tavily — только для типа "search" и "news" (там есть answer)
+  if (type === 'search' || type === 'news') {
+    tasks.push(tavilySearch(query, type === 'news' ? 'basic' : 'advanced').then(d => ({ source: 'tavily', data: d })).catch(() => null));
+  }
+
+  const results = (await Promise.all(tasks)).filter(Boolean);
+  const merged = mergeResults(results, type);
+
+  const output = {
+    ok: true,
+    type: type,
+    query: query,
+    enginesUsed: results.map(r => r.source),
+    answer: merged.answer,
+    count: merged.items.length,
+    // кладём в разные поля в зависимости от типа (совместимость с фронтом)
+    organic: type === 'search' ? merged.items : undefined,
+    videos: type === 'videos' ? merged.items : undefined,
+    images: type === 'images' ? merged.items : undefined,
+    news: type === 'news' ? merged.items : undefined,
+    // универсальное поле — все результаты
+    all: merged.items
+  };
+
+  cacheSet(cacheKey, output);
+  return output;
+}
+
+/* ============================================
+   FETCH URL (чтение страниц)
+   ============================================ */
 async function fetchYouTube(videoId) {
   const result = {
     type: 'youtube', videoId, title: '', description: '', channel: '',
@@ -211,12 +383,16 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') return send(res, 204, '');
 
-  /* ===== /api/health — открыт (для мониторинга) ===== */
+  /* /api/health — открыт */
   if (pathname === '/api/health') {
     return send(res, 200, {
       ok: true,
-      version: '1.3.0',
-      hasSerper: !!process.env.SERPER_KEY,
+      version: '2.0.0',
+      engines: {
+        serper1: !!SERPER_KEY_1,
+        serper2: !!SERPER_KEY_2,
+        tavily: !!TAVILY_KEY
+      },
       hasAuth: !!(process.env.SITE_USER && process.env.SITE_PASS),
       hasApiToken: !!process.env.API_TOKEN,
       chatclaud: process.env.CHATCLAUD_URL || 'https://chatclaud.onrender.com',
@@ -224,38 +400,21 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  /* ===== Все /api/* — требуют токен ИЛИ Basic Auth ===== */
+  /* Все /api/* — требуют токен или Basic Auth */
   if (pathname.startsWith('/api/')) {
     if (!checkApiAuth(req)) return requireAuth(res);
 
-    /* /api/search */
+    /* /api/search — МУЛЬТИПОИСК */
     if (pathname === '/api/search' && req.method === 'POST') {
       try {
         const body = await readBody(req);
-        const q = body.q || '';
+        const q = (body.q || '').trim();
         const type = body.type || 'search';
         if (!q) return send(res, 400, { error: 'q required' });
-        if (!process.env.SERPER_KEY) return send(res, 500, { error: 'SERPER_KEY not set' });
-
-        const endpoints = {
-          search: 'https://google.serper.dev/search',
-          images: 'https://google.serper.dev/images',
-          videos: 'https://google.serper.dev/videos',
-          news: 'https://google.serper.dev/news'
-        };
-        const url = endpoints[type] || endpoints.search;
-
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'X-API-KEY': process.env.SERPER_KEY,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ q, gl: 'ru', hl: 'ru', num: 20 })
-        });
-        const data = await r.json();
+        const data = await multiSearch(q, type);
         return send(res, 200, data);
       } catch (e) {
+        console.error('[search]', e);
         return send(res, 500, { error: e.message });
       }
     }
@@ -327,7 +486,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: 'not found' });
   }
 
-  /* ===== СТАТИКА — защищена Basic Auth ===== */
+  /* Статика — Basic Auth */
   if (!checkBasicAuth(req)) return requireAuth(res);
 
   let filePath = safeJoin(ROOT, pathname === '/' ? '/public/index.html' : pathname);
@@ -349,8 +508,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Nova Browser on port', PORT);
-  console.log('Serper:', process.env.SERPER_KEY ? 'OK' : 'MISSING');
+  console.log('Nova Browser v2.0 on port', PORT);
+  console.log('Serper #1:', SERPER_KEY_1 ? 'OK' : 'MISSING');
+  console.log('Serper #2:', SERPER_KEY_2 ? 'OK' : 'MISSING');
+  console.log('Tavily:   ', TAVILY_KEY ? 'OK' : 'MISSING');
   console.log('Basic Auth:', process.env.SITE_USER ? 'ON' : 'OFF');
-  console.log('API Token:', process.env.API_TOKEN ? 'ON' : 'OFF');
+  console.log('API Token: ', process.env.API_TOKEN ? 'ON' : 'OFF');
 });
