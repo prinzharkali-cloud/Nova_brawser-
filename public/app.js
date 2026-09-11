@@ -1,11 +1,9 @@
 (function(){
 'use strict';
 
-/* ============ КОНФИГ ============ */
 var AI_URL = 'https://chatclaud.onrender.com';
 var COMPANY = 'milanmichaimilan';
 
-/* ============ ХЕЛПЕРЫ ============ */
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function escA(s){ return String(s==null?'':s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -31,7 +29,6 @@ function toast(m, ms){
   toastTid = setTimeout(function(){ t.classList.remove('on'); }, ms);
 }
 
-/* ============ ПОЛЬЗОВАТЕЛЬ ============ */
 var currentUser = null;
 var authMode = 'login';
 
@@ -110,7 +107,6 @@ function renderAva(){
   }
 }
 
-/* ============ ВКЛАДКИ ============ */
 var tabs = [];
 var activeTab = null;
 
@@ -190,7 +186,6 @@ function reloadTab(){
   else if (t.query && t.mode !== 'home') doSearch(t.query, t.mode);
 }
 
-/* ============ ГЛАВНАЯ ============ */
 function goHome(){
   var t = getActive();
   if (!t){ newTab(); return; }
@@ -260,7 +255,6 @@ function startClock(){
   clockTid = setInterval(upd, 1000);
 }
 
-/* ============ ПОИСК ============ */
 var currentFilter = 'search';
 var acList = [];
 var acSel = -1;
@@ -421,7 +415,6 @@ function bindResults(){
   }
 }
 
-/* ============ ВИДЕО EMBED ============ */
 function videoEmbedUrl(url){
   if (!url) return null;
   var m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]{11})/);
@@ -445,7 +438,6 @@ function openEmbed(originalUrl, embedUrl){
   addTop(originalUrl, t.title);
 }
 
-/* ============ ОТКРЫТИЕ URL ============ */
 function openUrl(url){
   var t = getActive();
   if (!t) t = newTab(url);
@@ -530,7 +522,6 @@ function addTop(url, title){
   uSet('topSites', l.slice(0, 12));
 }
 
-/* ============ DRAWER ============ */
 function openDw(type){
   $('dw').classList.add('on');
   var titles = { bookmarks:'Закладки', history:'История', notes:'Заметки', settings:'Настройки' };
@@ -670,7 +661,6 @@ function endProg(){
   setTimeout(function(){ p.classList.remove('on'); b.style.width = '0%'; }, 300);
 }
 
-/* ============ AI ============ */
 var aiHistory = [];
 var aiBusy = false;
 function openAI(){ $('ai').classList.add('on'); setTimeout(function(){ $('aiIn').focus(); }, 200); }
@@ -764,7 +754,6 @@ function executeNovaCommand(action, value){
   }
 }
 
-/* Мост для внешних вызовов */
 window.NovaBridge = {
   version: '1.2',
   search: function(q, type){ currentFilter = type || 'search'; updateFilterBtns(); doSearch(q, currentFilter); },
@@ -782,7 +771,6 @@ window.addEventListener('message', function(e){
   if (d.type === 'nova-cmd' && d.action) executeNovaCommand(d.action, d.value || '');
 });
 
-/* ============ ОБРАБОТЧИКИ ============ */
 $('segL').addEventListener('click', function(){ setAuthMode('login'); });
 $('segR').addEventListener('click', function(){ setAuthMode('reg'); });
 $('btnGo').addEventListener('click', doAuth);
