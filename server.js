@@ -1,6 +1,5 @@
 /**
  * Nova Browser — server.js v3.1
- * + /api/social-deep (TikTok + Instagram без ключей)
  */
 const http = require('http');
 const fs = require('fs');
@@ -10,16 +9,10 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 
-/* ============================================
-   КЛЮЧИ
-   ============================================ */
 const SERPER_KEY_1 = process.env.SERPER_KEY || '34e2b98552e12dafa0dcf1eb81399f3cbc435019';
 const SERPER_KEY_2 = process.env.SERPER_KEY_2 || '1025273686ebb849b608e75816420fb6a99e7e78';
 const TAVILY_KEY   = process.env.TAVILY_KEY || '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';
 
-/* ============================================
-   КЕШ
-   ============================================ */
 const CACHE_TTL = {
   news:      5  * 60 * 1000,
   search:    30 * 60 * 1000,
@@ -49,9 +42,6 @@ function cacheSet(key, data) {
   }
 }
 
-/* ============================================
-   AUTH
-   ============================================ */
 function checkBasicAuth(req) {
   const user = process.env.SITE_USER;
   const pass = process.env.SITE_PASS;
@@ -64,6 +54,7 @@ function checkBasicAuth(req) {
     return decoded.slice(0, idx) === user && decoded.slice(idx + 1) === pass;
   } catch (e) { return false; }
 }
+
 function checkApiAuth(req) {
   const hasToken = !!process.env.API_TOKEN;
   const hasSite = !!(process.env.SITE_USER && process.env.SITE_PASS);
@@ -75,6 +66,7 @@ function checkApiAuth(req) {
   if (hasSite && checkBasicAuth(req)) return true;
   return false;
 }
+
 function requireAuth(res) {
   res.writeHead(401, {
     'WWW-Authenticate': 'Basic realm="Nova Browser"',
@@ -83,9 +75,6 @@ function requireAuth(res) {
   res.end('401 Unauthorized');
 }
 
-/* ============================================
-   УТИЛИТЫ
-   ============================================ */
 function send(res, code, body, type) {
   type = type || 'application/json; charset=utf-8';
   res.writeHead(code, {
@@ -171,6 +160,7 @@ function extractTitle(html) {
   const m = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return m ? htmlToText(m[1]).slice(0, 200) : '';
 }
+
 function extractMeta(html, name) {
   const re = new RegExp('<meta[^>]+(?:name|property)=["\']' + name + '["\'][^>]+content=["\']([^"\']+)["\']', 'i');
   const re2 = new RegExp('<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\']' + name + '["\']', 'i');
@@ -179,15 +169,9 @@ function extractMeta(html, name) {
 }
 
 function youtubeVideoId(url) {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]{11})/,
-    /youtube\.com\/watch\?.*v=([\w-]{11})/
-  ];
-  for (const re of patterns) {
-    const m = String(url).match(re);
-    if (m) return m[1];
-  }
-  return null;
+  const re = /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]{11})/;
+  const m = String(url).match(re);
+  return m ? m[1] : null;
 }
 
 function extractiveSummary(text, maxSentences) {
@@ -211,17 +195,12 @@ function extractiveSummary(text, maxSentences) {
   return picked.map(x => x.s).join(' ');
 }
 
-/* ============================================
-   SERPER
-   ============================================ */
 async function serperSearch(key, query, type, gl, hl) {
   const endpoints = {
     search: 'https://google.serper.dev/search',
     images: 'https://google.serper.dev/images',
     videos: 'https://google.serper.dev/videos',
-    news:   'https://google.serper.dev/news',
-    places: 'https://google.serper.dev/places',
-    scholar:'https://google.serper.dev/scholar'
+    news:   'https://google.serper.dev/news'
   };
   const url = endpoints[type] || endpoints.search;
   try {
@@ -235,9 +214,6 @@ async function serperSearch(key, query, type, gl, hl) {
   } catch (e) { return null; }
 }
 
-/* ============================================
-   TAVILY
-   ============================================ */
 async function tavilySearch(query, depth) {
   try {
     const r = await fetch('https://api.tavily.com/search', {
@@ -258,9 +234,6 @@ async function tavilySearch(query, depth) {
   } catch (e) { return null; }
 }
 
-/* ============================================
-   СЛИЯНИЕ
-   ============================================ */
 function normalizeUrl(u) {
   try {
     const x = new URL(u);
@@ -300,9 +273,6 @@ function mergeResults(engineResults) {
   return { items: merged, answer };
 }
 
-/* ============================================
-   МУЛЬТИПОИСК
-   ============================================ */
 async function multiSearch(query, type) {
   const cacheKey = 'search:' + type + ':' + query.toLowerCase();
   const cached = cacheGet(cacheKey, type);
@@ -337,9 +307,6 @@ async function multiSearch(query, type) {
   return output;
 }
 
-/* ============================================
-   YOUTUBE
-   ============================================ */
 function formatTimecode(seconds) {
   const s = Math.floor(seconds);
   const h = Math.floor(s / 3600);
@@ -364,13 +331,13 @@ async function fetchYouTube(videoId) {
     }
   } catch (e) {}
   try {
-    const pageRes = await fetch('https://www.youtube.com/watch?v=' + videoId, {
+    const r = await fetch('https://www.youtube.com/watch?v=' + videoId, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
         'Accept-Language': 'ru,en;q=0.9'
       }
     });
-    const html = await pageRes.text();
+    const html = await r.text();
     let m = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
     if (m) result.description = m[1];
     m = html.match(/"viewCount"\s*:\s*"(\d+)"/);
@@ -387,9 +354,9 @@ async function fetchYouTube(videoId) {
                  || tracks.find(t => t.languageCode && t.languageCode.startsWith('en'))
                  || tracks[0];
         if (track && track.baseUrl) {
-          const capRes = await fetch(track.baseUrl);
-          const capXml = await capRes.text();
-          const matches = [...capXml.matchAll(/<text[^>]*start="([\d.]+)"[^>]*?(?:dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g)];
+          const c = await fetch(track.baseUrl);
+          const xml = await c.text();
+          const matches = [...xml.matchAll(/<text[^>]*start="([\d.]+)"[^>]*?(?:dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g)];
           const timed = matches.map(x => ({
             start: parseFloat(x[1]),
             time: formatTimecode(parseFloat(x[1])),
@@ -480,9 +447,6 @@ async function fetchUrlContent(cleanUrl, maxLength) {
   };
 }
 
-/* ============================================
-   SOCIAL DEEP — TikTok + Instagram (без ключей)
-   ============================================ */
 function detectSocialPlatform(url) {
   if (/tiktok\.com/i.test(url)) return 'tiktok';
   if (/instagram\.com/i.test(url)) return 'instagram';
@@ -503,7 +467,6 @@ async function fetchTikTokDeep(url) {
 
   const match = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
   if (!match) {
-    // fallback: попробуем og:description
     const ogDesc = extractMeta(html, 'og:description');
     const ogTitle = extractMeta(html, 'og:title');
     if (ogDesc || ogTitle) {
@@ -521,11 +484,16 @@ async function fetchTikTokDeep(url) {
   }
 
   let data;
-  try { data = JSON.parse(match[1]); } catch (e) { throw new Error('tiktok json parse fail'); }
+  try { data = JSON.parse(match[1]); } catch (e) { throw new Error('tiktok json fail'); }
 
   const scope = data['__DEFAULT_SCOPE__'] || {};
-  const itemStruct = (scope['webapp.video-detail'] && ком scope['webapp.video-detail'].itemInfo && scope['webapp.videoментов-detail'].itemInfo.itemStruct)
-                  || (scope['webapp.reflow.video.detail'] && scope['webapp.re изflow.video.detail'].itemInfo && scope['webapp.reflow.video.detail'].itemInfo.item HTMLStruct);
+  let itemStruct = null;
+  if (scope['webapp.video-detail'] && scope['webapp.video-detail'].itemInfo) {
+    itemStruct = scope['webapp.video-detail'].itemInfo.itemStruct;
+  }
+  if (!itemStruct && scope['webapp.reflow.video.detail'] && scope['webapp.reflow.video.detail'].itemInfo) {
+    itemStruct = scope['webapp.reflow.video.detail'].itemInfo.itemStruct;
+  }
 
   if (!itemStruct) {
     const ogDesc = extractMeta(html, 'og:description');
@@ -535,14 +503,12 @@ async function fetchTikTokDeep(url) {
       author: '', likes: 0, comments: 0, plays: 0, shares: 0, saves: 0,
       music: '', cover: extractMeta(html, 'og:image') || '',
       topComments: [],
-      warning: 'no itemStruct, og fallback'
+      warning: 'no itemStruct'
     };
   }
 
   const stats = itemStruct.stats || {};
   const author = itemStruct.author || {};
-
-  // Пробуем вытащить хоть немного (если попались)
   const comments = [];
   const cRegex = /"text":"([^"]{3,200})","createTime":\d+,"diggCount":(\d+)/g;
   let cm;
@@ -592,7 +558,6 @@ async function fetchInstagramDeep(url) {
   const ogImage = extractMeta(html, 'og:image');
   const ogVideo = extractMeta(html, 'og:video');
 
-  // og:description обычно: "1,234 likes, 56 comments - username on date: \"caption\""
   let likes = 0, comments = 0, author = '', caption = '';
   if (ogDesc) {
     const statsM = ogDesc.match(/([\d,.]+)\s*Likes?,\s*([\d,.]+)\s*Comments?/i);
@@ -618,8 +583,7 @@ async function fetchInstagramDeep(url) {
     comments: comments,
     cover: ogImage || '',
     videoUrl: ogVideo || '',
-    topComments: [],
-    warning: comments === 0 ? 'Instagram закрывает публичные данные — только базовые метрики' : null
+    topComments: []
   };
 }
 
@@ -642,16 +606,12 @@ async function socialDeep(url) {
   }
 }
 
-/* ============================================
-   СЕРВЕР
-   ============================================ */
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url || '/', 'http://localhost');
   const pathname = u.pathname;
 
   if (req.method === 'OPTIONS') return send(res, 204, '');
 
-  /* /api/health — открыт */
   if (pathname === '/api/health') {
     return send(res, 200, {
       ok: true,
@@ -670,11 +630,9 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  /* Все /api/* — токен или Basic Auth */
   if (pathname.startsWith('/api/')) {
     if (!checkApiAuth(req)) return requireAuth(res);
 
-    /* /api/search — МУЛЬТИПОИСК */
     if (pathname === '/api/search' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -688,7 +646,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/fetch-url */
     if (pathname === '/api/fetch-url' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -708,7 +665,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/social-deep — TikTok + Instagram */
     if (pathname === '/api/social-deep' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -722,7 +678,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/multi-fetch */
     if (pathname === '/api/multi-fetch' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -756,7 +711,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/summarize */
     if (pathname === '/api/summarize' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -797,7 +751,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/related */
     if (pathname === '/api/related' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -821,7 +774,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/trending */
     if (pathname === '/api/trending' && req.method === 'GET') {
       try {
         const region = (u.searchParams.get('region') || 'ru').toLowerCase();
@@ -842,7 +794,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/ai — прокси к ChatClaud */
     if (pathname === '/api/ai' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -862,7 +813,6 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: 'not found' });
   }
 
-  /* Статика */
   if (!checkBasicAuth(req)) return requireAuth(res);
 
   let filePath = safeJoin(ROOT, pathname === '/' ? '/public/index.html' : pathname);
@@ -885,10 +835,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log('Nova Browser v3.1 on port', PORT);
-  console.log('Serper #1:', SERPER_KEY_1 ? 'OK' : 'MISSING');
-  console.log('Serper #2:', SERPER_KEY_2 ? 'OK' : 'MISSING');
-  console.log('Tavily:   ', TAVILY_KEY ? 'OK' : 'MISSING');
-  console.log('Basic Auth:', process.env.SITE_USER ? 'ON' : 'OFF');
-  console.log('API Token: ', process.env.API_TOKEN ? 'ON' : 'OFF');
-  console.log('Features: search, fetch-url, social-deep, multi-fetch, summarize, related, trending');
+  console.log('Serper1:', SERPER_KEY_1 ? 'OK' : 'MISSING');
+  console.log('Serper2:', SERPER_KEY_2 ? 'OK' : 'MISSING');
+  console.log('Tavily: ', TAVILY_KEY ? 'OK' : 'MISSING');
+  console.log('Auth:   ', process.env.SITE_USER ? 'ON' : 'OFF');
+  console.log('Token:  ', process.env.API_TOKEN ? 'ON' : 'OFF');
 });
