@@ -1,18 +1,6 @@
 /**
- * Nova Browser — server.js v3.0
- *
- * Новое:
- *   - Кеш с разным TTL по типу (news 5м, search 30м, fetch 24ч)
- *   - /api/summarize — сжатие страниц (extractive + Tavily answer)
- *   - /api/multi-fetch — читать много URL параллельно
- *   - /api/related — похожие запросы
- *   - /api/trending — тренды
- *   - YouTube: субтитры с таймкодами
- *
- * Env:
- *   SERPER_KEY, SERPER_KEY_2, TAVILY_KEY
- *   API_TOKEN, SITE_USER, SITE_PASS
- *   CHATCLAUD_URL, NODE_ENV
+ * Nova Browser — server.js v3.1
+ * + /api/social-deep (TikTok + Instagram без ключей)
  */
 const http = require('http');
 const fs = require('fs');
@@ -30,7 +18,7 @@ const SERPER_KEY_2 = process.env.SERPER_KEY_2 || '1025273686ebb849b608e75816420f
 const TAVILY_KEY   = process.env.TAVILY_KEY || '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';
 
 /* ============================================
-   КЕШ с TTL по типу
+   КЕШ
    ============================================ */
 const CACHE_TTL = {
   news:      5  * 60 * 1000,
@@ -40,9 +28,9 @@ const CACHE_TTL = {
   fetch:     24 * 60 * 60 * 1000,
   summarize: 6  * 60 * 60 * 1000,
   related:   60 * 60 * 1000,
-  trending:  15 * 60 * 1000
+  trending:  15 * 60 * 1000,
+  social:    30 * 60 * 1000
 };
-
 const cache = new Map();
 const CACHE_MAX_SIZE = 500;
 
@@ -76,7 +64,6 @@ function checkBasicAuth(req) {
     return decoded.slice(0, idx) === user && decoded.slice(idx + 1) === pass;
   } catch (e) { return false; }
 }
-
 function checkApiAuth(req) {
   const hasToken = !!process.env.API_TOKEN;
   const hasSite = !!(process.env.SITE_USER && process.env.SITE_PASS);
@@ -88,7 +75,6 @@ function checkApiAuth(req) {
   if (hasSite && checkBasicAuth(req)) return true;
   return false;
 }
-
 function requireAuth(res) {
   res.writeHead(401, {
     'WWW-Authenticate': 'Basic realm="Nova Browser"',
@@ -185,7 +171,6 @@ function extractTitle(html) {
   const m = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return m ? htmlToText(m[1]).slice(0, 200) : '';
 }
-
 function extractMeta(html, name) {
   const re = new RegExp('<meta[^>]+(?:name|property)=["\']' + name + '["\'][^>]+content=["\']([^"\']+)["\']', 'i');
   const re2 = new RegExp('<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\']' + name + '["\']', 'i');
@@ -205,36 +190,24 @@ function youtubeVideoId(url) {
   return null;
 }
 
-/* ============================================
-   EXTRACTIVE SUMMARY (без LLM)
-   ============================================ */
 function extractiveSummary(text, maxSentences) {
   maxSentences = maxSentences || 6;
   const src = String(text || '').replace(/\s+/g, ' ').trim();
   if (src.length < 200) return src;
-
-  // Разбиваем на предложения
-  const sentences = src
-    .split(/(?<=[.!?…])\s+(?=[А-ЯA-Z«"])/)
-    .filter(s => s.length > 30 && s.length < 400);
-
+  const sentences = src.split(/(?<=[.!?…])\s+(?=[А-ЯA-Z«"])/).filter(s => s.length > 30 && s.length < 400);
   if (sentences.length <= maxSentences) return sentences.join(' ');
-
-  // Скор предложений
   const scored = sentences.map((s, i) => {
     let score = 0;
-    if (i === 0) score += 3;         // первое предложение
-    if (i === 1) score += 2;         // второе
-    if (/\d/.test(s)) score += 2;    // есть числа
-    if (/[А-ЯA-Z]{3,}/.test(s)) score += 1;  // есть аббревиатуры
+    if (i === 0) score += 3;
+    if (i === 1) score += 2;
+    if (/\d/.test(s)) score += 2;
+    if (/[А-ЯA-Z]{3,}/.test(s)) score += 1;
     if (/(важно|главное|ключев|итог|основн|результат|вывод)/i.test(s)) score += 2;
-    if (s.length > 80 && s.length < 250) score += 1;  // средняя длина
+    if (s.length > 80 && s.length < 250) score += 1;
     return { s, i, score };
   });
-
   scored.sort((a, b) => b.score - a.score);
   const picked = scored.slice(0, maxSentences).sort((a, b) => a.i - b.i);
-
   return picked.map(x => x.s).join(' ');
 }
 
@@ -254,21 +227,12 @@ async function serperSearch(key, query, type, gl, hl) {
   try {
     const r = await fetch(url, {
       method: 'POST',
-      headers: {
-        'X-API-KEY': key,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ q: query, gl: gl || 'ru', hl: hl || 'ru', num: 20 })
     });
-    if (!r.ok) {
-      console.warn('[serper] HTTP', r.status, 'type=' + type);
-      return null;
-    }
+    if (!r.ok) return null;
     return await r.json();
-  } catch (e) {
-    console.warn('[serper] fail:', e.message);
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 /* ============================================
@@ -289,19 +253,13 @@ async function tavilySearch(query, depth) {
         topic: 'general'
       })
     });
-    if (!r.ok) {
-      console.warn('[tavily] HTTP', r.status);
-      return null;
-    }
+    if (!r.ok) return null;
     return await r.json();
-  } catch (e) {
-    console.warn('[tavily] fail:', e.message);
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 /* ============================================
-   СЛИЯНИЕ РЕЗУЛЬТАТОВ
+   СЛИЯНИЕ
    ============================================ */
 function normalizeUrl(u) {
   try {
@@ -310,10 +268,9 @@ function normalizeUrl(u) {
   } catch (e) { return String(u || '').toLowerCase(); }
 }
 
-function mergeResults(engineResults, type) {
+function mergeResults(engineResults) {
   const merged = [];
   const seen = new Set();
-
   engineResults.forEach((er) => {
     if (!er || !er.data) return;
     const arr = er.data.organic || er.data.videos || er.data.images || er.data.news || [];
@@ -334,15 +291,12 @@ function mergeResults(engineResults, type) {
       });
     });
   });
-
   const tavilyAnswer = engineResults.find(e => e && e.source === 'tavily');
   const answer = tavilyAnswer && tavilyAnswer.data && tavilyAnswer.data.answer ? tavilyAnswer.data.answer : null;
-
   merged.sort((a, b) => {
     if (b.weight !== a.weight) return b.weight - a.weight;
     return a.position - b.position;
   });
-
   return { items: merged, answer };
 }
 
@@ -352,10 +306,7 @@ function mergeResults(engineResults, type) {
 async function multiSearch(query, type) {
   const cacheKey = 'search:' + type + ':' + query.toLowerCase();
   const cached = cacheGet(cacheKey, type);
-  if (cached) {
-    console.log('[cache hit]', cacheKey);
-    return cached;
-  }
+  if (cached) return cached;
 
   const tasks = [];
   tasks.push(serperSearch(SERPER_KEY_1, query, type).then(d => ({ source: 'serper1', data: d })).catch(() => null));
@@ -367,7 +318,7 @@ async function multiSearch(query, type) {
   }
 
   const results = (await Promise.all(tasks)).filter(Boolean);
-  const merged = mergeResults(results, type);
+  const merged = mergeResults(results);
 
   const output = {
     ok: true,
@@ -382,13 +333,12 @@ async function multiSearch(query, type) {
     news: type === 'news' ? merged.items : undefined,
     all: merged.items
   };
-
   cacheSet(cacheKey, output);
   return output;
 }
 
 /* ============================================
-   YOUTUBE — субтитры с таймкодами
+   YOUTUBE
    ============================================ */
 function formatTimecode(seconds) {
   const s = Math.floor(seconds);
@@ -405,7 +355,6 @@ async function fetchYouTube(videoId) {
     duration: '', views: '', subtitles: '', subtitlesTimed: [],
     url: 'https://www.youtube.com/watch?v=' + videoId
   };
-
   try {
     const oe = await fetch('https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=' + videoId + '&format=json');
     if (oe.ok) {
@@ -414,7 +363,6 @@ async function fetchYouTube(videoId) {
       result.channel = j.author_name || '';
     }
   } catch (e) {}
-
   try {
     const pageRes = await fetch('https://www.youtube.com/watch?v=' + videoId, {
       headers: {
@@ -431,8 +379,6 @@ async function fetchYouTube(videoId) {
     if (m && !result.channel) result.channel = m[1];
     m = html.match(/"lengthSeconds"\s*:\s*"(\d+)"/);
     if (m) result.duration = formatTimecode(parseInt(m[1], 10));
-
-    // Субтитры
     m = html.match(/"captionTracks"\s*:\s*(\[[\s\S]*?\])/);
     if (m) {
       try {
@@ -443,35 +389,23 @@ async function fetchYouTube(videoId) {
         if (track && track.baseUrl) {
           const capRes = await fetch(track.baseUrl);
           const capXml = await capRes.text();
-
-          // Парсим с таймкодами
           const matches = [...capXml.matchAll(/<text[^>]*start="([\d.]+)"[^>]*?(?:dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g)];
           const timed = matches.map(x => ({
             start: parseFloat(x[1]),
             time: formatTimecode(parseFloat(x[1])),
-            text: x[3].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
-              .replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\n/g,' ').trim()
+            text: x[3].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\n/g,' ').trim()
           })).filter(x => x.text);
-
           if (timed.length) {
-            // Разбиваем на 30-секундные блоки
             const blocks = [];
             let cur = { time: timed[0].time, start: timed[0].start, text: '' };
             timed.forEach(item => {
               if (item.start - cur.start > 30) {
                 if (cur.text.trim()) blocks.push(cur);
                 cur = { time: item.time, start: item.start, text: item.text };
-              } else {
-                cur.text += ' ' + item.text;
-              }
+              } else cur.text += ' ' + item.text;
             });
             if (cur.text.trim()) blocks.push(cur);
-
-            result.subtitlesTimed = blocks.slice(0, 100).map(b => ({
-              time: b.time,
-              text: b.text.trim().slice(0, 300)
-            }));
-
+            result.subtitlesTimed = blocks.slice(0, 100).map(b => ({ time: b.time, text: b.text.trim().slice(0, 300) }));
             result.subtitles = timed.map(x => x.text).join(' ').slice(0, 8000);
           }
         }
@@ -498,13 +432,8 @@ async function fetchOembed(url) {
   return null;
 }
 
-/* ============================================
-   FETCH URL (главная функция)
-   ============================================ */
 async function fetchUrlContent(cleanUrl, maxLength) {
   maxLength = maxLength || 12000;
-
-  // YouTube
   const ytId = youtubeVideoId(cleanUrl);
   if (ytId) {
     const yt = await fetchYouTube(ytId);
@@ -517,8 +446,6 @@ async function fetchUrlContent(cleanUrl, maxLength) {
       hasSubtitles: !!yt.subtitles
     };
   }
-
-  // VK / Rutube / Vimeo
   const oe = await fetchOembed(cleanUrl);
   if (oe) {
     return {
@@ -527,8 +454,6 @@ async function fetchUrlContent(cleanUrl, maxLength) {
       channel: oe.author_name || '', thumbnail: oe.thumbnail_url || ''
     };
   }
-
-  // Обычная страница
   const r = await fetch(cleanUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; NovaBot/1.0; +https://nova-browser.onrender.com)',
@@ -538,17 +463,14 @@ async function fetchUrlContent(cleanUrl, maxLength) {
     redirect: 'follow'
   });
   if (!r.ok) return { ok: false, error: 'HTTP ' + r.status, url: cleanUrl };
-
   const ct = r.headers.get('content-type') || '';
   if (!ct.includes('text/html') && !ct.includes('text/plain')) {
     return { ok: true, type: 'file', url: cleanUrl, contentType: ct, message: 'Не HTML' };
   }
-
   const html = await r.text();
   const title = extractTitle(html);
   const description = extractMeta(html, 'description') || extractMeta(html, 'og:description');
   const fullText = htmlToText(html);
-
   return {
     ok: true, type: 'page', url: cleanUrl, title, description,
     text: fullText.slice(0, maxLength),
@@ -556,6 +478,168 @@ async function fetchUrlContent(cleanUrl, maxLength) {
     truncated: fullText.length > maxLength,
     summary: extractiveSummary(fullText, 5)
   };
+}
+
+/* ============================================
+   SOCIAL DEEP — TikTok + Instagram (без ключей)
+   ============================================ */
+function detectSocialPlatform(url) {
+  if (/tiktok\.com/i.test(url)) return 'tiktok';
+  if (/instagram\.com/i.test(url)) return 'instagram';
+  return null;
+}
+
+async function fetchTikTokDeep(url) {
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'ru,en;q=0.9'
+    },
+    redirect: 'follow'
+  });
+  if (!r.ok) throw new Error('tiktok http ' + r.status);
+  const html = await r.text();
+
+  const match = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) {
+    // fallback: попробуем og:description
+    const ogDesc = extractMeta(html, 'og:description');
+    const ogTitle = extractMeta(html, 'og:title');
+    if (ogDesc || ogTitle) {
+      return {
+        ok: true, platform: 'tiktok', url,
+        title: ogTitle || ogDesc || '',
+        description: ogDesc || '',
+        author: '', likes: 0, comments: 0, plays: 0, shares: 0, saves: 0,
+        music: '', cover: extractMeta(html, 'og:image') || '',
+        topComments: [],
+        warning: 'limited data'
+      };
+    }
+    throw new Error('tiktok data not found');
+  }
+
+  let data;
+  try { data = JSON.parse(match[1]); } catch (e) { throw new Error('tiktok json parse fail'); }
+
+  const scope = data['__DEFAULT_SCOPE__'] || {};
+  const itemStruct = (scope['webapp.video-detail'] && ком scope['webapp.video-detail'].itemInfo && scope['webapp.videoментов-detail'].itemInfo.itemStruct)
+                  || (scope['webapp.reflow.video.detail'] && scope['webapp.re изflow.video.detail'].itemInfo && scope['webapp.reflow.video.detail'].itemInfo.item HTMLStruct);
+
+  if (!itemStruct) {
+    const ogDesc = extractMeta(html, 'og:description');
+    return {
+      ok: true, platform: 'tiktok', url,
+      title: ogDesc || '',
+      author: '', likes: 0, comments: 0, plays: 0, shares: 0, saves: 0,
+      music: '', cover: extractMeta(html, 'og:image') || '',
+      topComments: [],
+      warning: 'no itemStruct, og fallback'
+    };
+  }
+
+  const stats = itemStruct.stats || {};
+  const author = itemStruct.author || {};
+
+  // Пробуем вытащить хоть немного (если попались)
+  const comments = [];
+  const cRegex = /"text":"([^"]{3,200})","createTime":\d+,"diggCount":(\d+)/g;
+  let cm;
+  while ((cm = cRegex.exec(html)) !== null && comments.length < 15) {
+    comments.push({ text: cm[1], likes: parseInt(cm[2], 10) });
+  }
+  comments.sort((a, b) => b.likes - a.likes);
+
+  return {
+    ok: true,
+    platform: 'tiktok',
+    url: url,
+    title: itemStruct.desc || '',
+    author: author.uniqueId || author.nickname || '',
+    authorNick: author.nickname || '',
+    likes: stats.diggCount || 0,
+    comments: stats.commentCount || 0,
+    plays: stats.playCount || 0,
+    shares: stats.shareCount || 0,
+    saves: stats.collectCount || 0,
+    music: (itemStruct.music && itemStruct.music.title) || '',
+    cover: (itemStruct.video && itemStruct.video.cover) || '',
+    duration: itemStruct.video && itemStruct.video.duration ? formatTimecode(itemStruct.video.duration) : '',
+    topComments: comments.slice(0, 10)
+  };
+}
+
+async function fetchInstagramDeep(url) {
+  const codeMatch = url.match(/\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/);
+  if (!codeMatch) throw new Error('instagram code not found');
+  const shortcode = codeMatch[2];
+
+  const apiUrl = 'https://www.instagram.com/p/' + shortcode + '/';
+  const r = await fetch(apiUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      'Accept-Language': 'ru,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml'
+    },
+    redirect: 'follow'
+  });
+  if (!r.ok) throw new Error('instagram http ' + r.status);
+  const html = await r.text();
+
+  const ogTitle = extractMeta(html, 'og:title');
+  const ogDesc = extractMeta(html, 'og:description');
+  const ogImage = extractMeta(html, 'og:image');
+  const ogVideo = extractMeta(html, 'og:video');
+
+  // og:description обычно: "1,234 likes, 56 comments - username on date: \"caption\""
+  let likes = 0, comments = 0, author = '', caption = '';
+  if (ogDesc) {
+    const statsM = ogDesc.match(/([\d,.]+)\s*Likes?,\s*([\d,.]+)\s*Comments?/i);
+    if (statsM) {
+      likes = parseInt(statsM[1].replace(/[,.]/g, ''), 10) || 0;
+      comments = parseInt(statsM[2].replace(/[,.]/g, ''), 10) || 0;
+    }
+    const authorM = ogDesc.match(/-\s*([^\s]+)\s+on/i);
+    if (authorM) author = authorM[1];
+    const captionM = ogDesc.match(/:\s*["«]([^"»]+)["»]/);
+    if (captionM) caption = captionM[1];
+  }
+
+  return {
+    ok: true,
+    platform: 'instagram',
+    url: url,
+    shortcode: shortcode,
+    title: caption || ogTitle || '',
+    description: ogDesc || '',
+    author: author,
+    likes: likes,
+    comments: comments,
+    cover: ogImage || '',
+    videoUrl: ogVideo || '',
+    topComments: [],
+    warning: comments === 0 ? 'Instagram закрывает публичные данные — только базовые метрики' : null
+  };
+}
+
+async function socialDeep(url) {
+  const platform = detectSocialPlatform(url);
+  if (!platform) return { ok: false, error: 'unsupported platform' };
+
+  const cacheKey = 'social:' + url;
+  const cached = cacheGet(cacheKey, 'social');
+  if (cached) return cached;
+
+  try {
+    let result;
+    if (platform === 'tiktok') result = await fetchTikTokDeep(url);
+    else result = await fetchInstagramDeep(url);
+    if (result && result.ok) cacheSet(cacheKey, result);
+    return result;
+  } catch (e) {
+    return { ok: false, error: platform + ': ' + e.message, url: url, platform: platform };
+  }
 }
 
 /* ============================================
@@ -571,7 +655,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/health') {
     return send(res, 200, {
       ok: true,
-      version: '3.0.0',
+      version: '3.1.0',
       engines: {
         serper1: !!SERPER_KEY_1,
         serper2: !!SERPER_KEY_2,
@@ -581,6 +665,7 @@ const server = http.createServer(async (req, res) => {
       hasApiToken: !!process.env.API_TOKEN,
       chatclaud: process.env.CHATCLAUD_URL || 'https://chatclaud.onrender.com',
       cacheSize: cache.size,
+      features: ['search', 'fetch-url', 'multi-fetch', 'summarize', 'related', 'trending', 'social-deep'],
       time: new Date().toISOString()
     });
   }
@@ -599,7 +684,6 @@ const server = http.createServer(async (req, res) => {
         const data = await multiSearch(q, type);
         return send(res, 200, data);
       } catch (e) {
-        console.error('[search]', e);
         return send(res, 500, { error: e.message });
       }
     }
@@ -624,7 +708,21 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/multi-fetch — читать несколько URL параллельно */
+    /* /api/social-deep — TikTok + Instagram */
+    if (pathname === '/api/social-deep' && req.method === 'POST') {
+      try {
+        const body = await readBody(req);
+        const url = (body.url || '').trim();
+        if (!url) return send(res, 400, { error: 'url required' });
+        if (!isSafeUrl(url)) return send(res, 400, { error: 'unsafe url' });
+        const result = await socialDeep(url);
+        return send(res, 200, result);
+      } catch (e) {
+        return send(res, 500, { error: e.message });
+      }
+    }
+
+    /* /api/multi-fetch */
     if (pathname === '/api/multi-fetch' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -658,7 +756,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/summarize — сжатие страницы или текста */
+    /* /api/summarize */
     if (pathname === '/api/summarize' && req.method === 'POST') {
       try {
         const body = await readBody(req);
@@ -668,7 +766,6 @@ const server = http.createServer(async (req, res) => {
 
         if (!url && !text) return send(res, 400, { error: 'url or text required' });
 
-        // Если URL — сначала читаем
         if (url) {
           if (!isSafeUrl(url)) return send(res, 400, { error: 'unsafe url' });
           const cacheKey = 'summarize:' + url + ':' + maxSentences;
@@ -680,81 +777,43 @@ const server = http.createServer(async (req, res) => {
 
           if (page.type === 'video' && page.subtitles) {
             const summary = extractiveSummary(page.subtitles, maxSentences);
-            const result = {
-              ok: true,
-              type: 'video',
-              url,
-              title: page.title,
-              channel: page.channel,
-              summary,
-              timed: page.subtitlesTimed || []
-            };
+            const result = { ok: true, type: 'video', url, title: page.title, channel: page.channel, summary, timed: page.subtitlesTimed || [] };
             cacheSet(cacheKey, result);
             return send(res, 200, result);
           }
-
           if (page.type === 'page' && page.text) {
             const summary = extractiveSummary(page.text, maxSentences);
-            const result = {
-              ok: true,
-              type: 'page',
-              url,
-              title: page.title,
-              summary,
-              keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6)
-            };
+            const result = { ok: true, type: 'page', url, title: page.title, summary, keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6) };
             cacheSet(cacheKey, result);
             return send(res, 200, result);
           }
-
           return send(res, 200, { ok: true, type: page.type, url, summary: page.description || page.title || '' });
         }
 
-        // Если просто текст
         const summary = extractiveSummary(text, maxSentences);
-        return send(res, 200, {
-          ok: true,
-          type: 'text',
-          summary,
-          keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6)
-        });
+        return send(res, 200, { ok: true, type: 'text', summary, keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6) });
       } catch (e) {
         return send(res, 500, { error: e.message });
       }
     }
 
-    /* /api/related — похожие запросы */
+    /* /api/related */
     if (pathname === '/api/related' && req.method === 'POST') {
       try {
         const body = await readBody(req);
         const q = (body.q || '').trim();
         if (!q) return send(res, 400, { error: 'q required' });
-
         const cacheKey = 'related:' + q.toLowerCase();
         const cached = cacheGet(cacheKey, 'related');
         if (cached) return send(res, 200, cached);
 
-        // Serper даёт relatedSearches в organic
         const data = await serperSearch(SERPER_KEY_1, q, 'search');
         const related = [];
         if (data) {
-          if (Array.isArray(data.relatedSearches)) {
-            data.relatedSearches.forEach(r => {
-              if (r.query) related.push(r.query);
-            });
-          }
-          if (data.peopleAlsoAsk) {
-            data.peopleAlsoAsk.forEach(r => {
-              if (r.question) related.push(r.question);
-            });
-          }
+          if (Array.isArray(data.relatedSearches)) data.relatedSearches.forEach(r => { if (r.query) related.push(r.query); });
+          if (data.peopleAlsoAsk) data.peopleAlsoAsk.forEach(r => { if (r.question) related.push(r.question); });
         }
-
-        const result = {
-          ok: true,
-          query: q,
-          related: related.slice(0, 10)
-        };
+        const result = { ok: true, query: q, related: related.slice(0, 10) };
         cacheSet(cacheKey, result);
         return send(res, 200, result);
       } catch (e) {
@@ -762,7 +821,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    /* /api/trending — тренды */
+    /* /api/trending */
     if (pathname === '/api/trending' && req.method === 'GET') {
       try {
         const region = (u.searchParams.get('region') || 'ru').toLowerCase();
@@ -770,16 +829,11 @@ const server = http.createServer(async (req, res) => {
         const cached = cacheGet(cacheKey, 'trending');
         if (cached) return send(res, 200, cached);
 
-        // Serper /news по общей теме
         const data = await serperSearch(SERPER_KEY_1, region === 'ru' ? 'новости сегодня' : 'top news today', 'news', region, region);
         const items = (data && data.news) || [];
         const trends = items.slice(0, 10).map(n => ({
-          title: n.title || '',
-          source: n.source || '',
-          date: n.date || '',
-          link: n.link || ''
+          title: n.title || '', source: n.source || '', date: n.date || '', link: n.link || ''
         }));
-
         const result = { ok: true, region, count: trends.length, trends };
         cacheSet(cacheKey, result);
         return send(res, 200, result);
@@ -830,10 +884,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Nova Browser v3.0 on port', PORT);
+  console.log('Nova Browser v3.1 on port', PORT);
   console.log('Serper #1:', SERPER_KEY_1 ? 'OK' : 'MISSING');
   console.log('Serper #2:', SERPER_KEY_2 ? 'OK' : 'MISSING');
   console.log('Tavily:   ', TAVILY_KEY ? 'OK' : 'MISSING');
   console.log('Basic Auth:', process.env.SITE_USER ? 'ON' : 'OFF');
   console.log('API Token: ', process.env.API_TOKEN ? 'ON' : 'OFF');
+  console.log('Features: search, fetch-url, social-deep, multi-fetch, summarize, related, trending');
 });
