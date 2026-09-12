@@ -1,6 +1,18 @@
 /**
- * Nova Browser — server.js
- * Мультидвижок: Serper #1 + Serper #2 + Tavily работают вместе.
+ * Nova Browser — server.js v3.0
+ *
+ * Новое:
+ *   - Кеш с разным TTL по типу (news 5м, search 30м, fetch 24ч)
+ *   - /api/summarize — сжатие страниц (extractive + Tavily answer)
+ *   - /api/multi-fetch — читать много URL параллельно
+ *   - /api/related — похожие запросы
+ *   - /api/trending — тренды
+ *   - YouTube: субтитры с таймкодами
+ *
+ * Env:
+ *   SERPER_KEY, SERPER_KEY_2, TAVILY_KEY
+ *   API_TOKEN, SITE_USER, SITE_PASS
+ *   CHATCLAUD_URL, NODE_ENV
  */
 const http = require('http');
 const fs = require('fs');
@@ -11,27 +23,39 @@ const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 
 /* ============================================
-   КЛЮЧИ (из env, с fallback на встроенные)
+   КЛЮЧИ
    ============================================ */
 const SERPER_KEY_1 = process.env.SERPER_KEY || '34e2b98552e12dafa0dcf1eb81399f3cbc435019';
 const SERPER_KEY_2 = process.env.SERPER_KEY_2 || '1025273686ebb849b608e75816420fb6a99e7e78';
 const TAVILY_KEY   = process.env.TAVILY_KEY || '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';
 
 /* ============================================
-   КЕШ (чтобы не жечь лимиты)
+   КЕШ с TTL по типу
    ============================================ */
-const CACHE_TTL = 10 * 60 * 1000; // 10 минут
-const cache = new Map();
+const CACHE_TTL = {
+  news:      5  * 60 * 1000,
+  search:    30 * 60 * 1000,
+  videos:    2  * 60 * 60 * 1000,
+  images:    2  * 60 * 60 * 1000,
+  fetch:     24 * 60 * 60 * 1000,
+  summarize: 6  * 60 * 60 * 1000,
+  related:   60 * 60 * 1000,
+  trending:  15 * 60 * 1000
+};
 
-function cacheGet(key) {
+const cache = new Map();
+const CACHE_MAX_SIZE = 500;
+
+function cacheGet(key, type) {
   const v = cache.get(key);
   if (!v) return null;
-  if (Date.now() - v.t > CACHE_TTL) { cache.delete(key); return null; }
+  const ttl = CACHE_TTL[type] || CACHE_TTL.search;
+  if (Date.now() - v.t > ttl) { cache.delete(key); return null; }
   return v.data;
 }
 function cacheSet(key, data) {
   cache.set(key, { t: Date.now(), data });
-  if (cache.size > 300) {
+  if (cache.size > CACHE_MAX_SIZE) {
     const oldest = [...cache.keys()].slice(0, 100);
     oldest.forEach(k => cache.delete(k));
   }
@@ -113,7 +137,8 @@ function contentType(filePath) {
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
     '.svg': 'image/svg+xml',
-    '.ico': 'image/x-icon'
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp'
   };
   return map[ext] || 'application/octet-stream';
 }
@@ -150,7 +175,8 @@ function htmlToText(html) {
   s = s.replace(/<[^>]+>/g, ' ');
   s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
        .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-       .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+       .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+       .replace(/&mdash;/g, '—').replace(/&ndash;/g, '–');
   s = s.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n');
   return s.trim();
 }
@@ -160,23 +186,69 @@ function extractTitle(html) {
   return m ? htmlToText(m[1]).slice(0, 200) : '';
 }
 
+function extractMeta(html, name) {
+  const re = new RegExp('<meta[^>]+(?:name|property)=["\']' + name + '["\'][^>]+content=["\']([^"\']+)["\']', 'i');
+  const re2 = new RegExp('<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\']' + name + '["\']', 'i');
+  const m = String(html).match(re) || String(html).match(re2);
+  return m ? m[1].slice(0, 500) : '';
+}
+
 function youtubeVideoId(url) {
-  const re = /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]{11})/;
-  const m = String(url).match(re);
-  return m ? m[1] : null;
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]{11})/,
+    /youtube\.com\/watch\?.*v=([\w-]{11})/
+  ];
+  for (const re of patterns) {
+    const m = String(url).match(re);
+    if (m) return m[1];
+  }
+  return null;
 }
 
 /* ============================================
-   ПОИСК: SERPER (два ключа)
+   EXTRACTIVE SUMMARY (без LLM)
+   ============================================ */
+function extractiveSummary(text, maxSentences) {
+  maxSentences = maxSentences || 6;
+  const src = String(text || '').replace(/\s+/g, ' ').trim();
+  if (src.length < 200) return src;
+
+  // Разбиваем на предложения
+  const sentences = src
+    .split(/(?<=[.!?…])\s+(?=[А-ЯA-Z«"])/)
+    .filter(s => s.length > 30 && s.length < 400);
+
+  if (sentences.length <= maxSentences) return sentences.join(' ');
+
+  // Скор предложений
+  const scored = sentences.map((s, i) => {
+    let score = 0;
+    if (i === 0) score += 3;         // первое предложение
+    if (i === 1) score += 2;         // второе
+    if (/\d/.test(s)) score += 2;    // есть числа
+    if (/[А-ЯA-Z]{3,}/.test(s)) score += 1;  // есть аббревиатуры
+    if (/(важно|главное|ключев|итог|основн|результат|вывод)/i.test(s)) score += 2;
+    if (s.length > 80 && s.length < 250) score += 1;  // средняя длина
+    return { s, i, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const picked = scored.slice(0, maxSentences).sort((a, b) => a.i - b.i);
+
+  return picked.map(x => x.s).join(' ');
+}
+
+/* ============================================
+   SERPER
    ============================================ */
 async function serperSearch(key, query, type, gl, hl) {
   const endpoints = {
     search: 'https://google.serper.dev/search',
     images: 'https://google.serper.dev/images',
     videos: 'https://google.serper.dev/videos',
-    news: 'https://google.serper.dev/news',
+    news:   'https://google.serper.dev/news',
     places: 'https://google.serper.dev/places',
-    scholar: 'https://google.serper.dev/scholar'
+    scholar:'https://google.serper.dev/scholar'
   };
   const url = endpoints[type] || endpoints.search;
   try {
@@ -200,7 +272,7 @@ async function serperSearch(key, query, type, gl, hl) {
 }
 
 /* ============================================
-   ПОИСК: TAVILY
+   TAVILY
    ============================================ */
 async function tavilySearch(query, depth) {
   try {
@@ -239,11 +311,9 @@ function normalizeUrl(u) {
 }
 
 function mergeResults(engineResults, type) {
-  // engineResults = [{ source: 'serper1'|'serper2'|'tavily', data: {...} }]
   const merged = [];
   const seen = new Set();
 
-  // 1) Serper organic/videos/images/news
   engineResults.forEach((er) => {
     if (!er || !er.data) return;
     const arr = er.data.organic || er.data.videos || er.data.images || er.data.news || [];
@@ -260,17 +330,14 @@ function mergeResults(engineResults, type) {
         imageUrl: item.imageUrl || item.thumbnailUrl || '',
         position: idx,
         engine: er.source,
-        // ranking weight: serper1=3, serper2=2, tavily=1
         weight: er.source === 'serper1' ? 3 : er.source === 'serper2' ? 2 : 1
       });
     });
   });
 
-  // 2) Tavily answer — отдельно
   const tavilyAnswer = engineResults.find(e => e && e.source === 'tavily');
   const answer = tavilyAnswer && tavilyAnswer.data && tavilyAnswer.data.answer ? tavilyAnswer.data.answer : null;
 
-  // 3) Сортировка: сначала взвешенные, потом по позиции
   merged.sort((a, b) => {
     if (b.weight !== a.weight) return b.weight - a.weight;
     return a.position - b.position;
@@ -280,27 +347,21 @@ function mergeResults(engineResults, type) {
 }
 
 /* ============================================
-   МУЛЬТИПОИСК — все три движка параллельно
+   МУЛЬТИПОИСК
    ============================================ */
 async function multiSearch(query, type) {
-  const cacheKey = type + ':' + query.toLowerCase();
-  const cached = cacheGet(cacheKey);
+  const cacheKey = 'search:' + type + ':' + query.toLowerCase();
+  const cached = cacheGet(cacheKey, type);
   if (cached) {
     console.log('[cache hit]', cacheKey);
     return cached;
   }
 
   const tasks = [];
-
-  // Serper #1 — основной
   tasks.push(serperSearch(SERPER_KEY_1, query, type).then(d => ({ source: 'serper1', data: d })).catch(() => null));
-
-  // Serper #2 — второй ключ (тоже параллельно — больше результатов)
   if (SERPER_KEY_2 && SERPER_KEY_2 !== SERPER_KEY_1) {
     tasks.push(serperSearch(SERPER_KEY_2, query, type).then(d => ({ source: 'serper2', data: d })).catch(() => null));
   }
-
-  // Tavily — только для типа "search" и "news" (там есть answer)
   if (type === 'search' || type === 'news') {
     tasks.push(tavilySearch(query, type === 'news' ? 'basic' : 'advanced').then(d => ({ source: 'tavily', data: d })).catch(() => null));
   }
@@ -315,12 +376,10 @@ async function multiSearch(query, type) {
     enginesUsed: results.map(r => r.source),
     answer: merged.answer,
     count: merged.items.length,
-    // кладём в разные поля в зависимости от типа (совместимость с фронтом)
     organic: type === 'search' ? merged.items : undefined,
     videos: type === 'videos' ? merged.items : undefined,
     images: type === 'images' ? merged.items : undefined,
     news: type === 'news' ? merged.items : undefined,
-    // универсальное поле — все результаты
     all: merged.items
   };
 
@@ -329,13 +388,24 @@ async function multiSearch(query, type) {
 }
 
 /* ============================================
-   FETCH URL (чтение страниц)
+   YOUTUBE — субтитры с таймкодами
    ============================================ */
+function formatTimecode(seconds) {
+  const s = Math.floor(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+  return m + ':' + String(sec).padStart(2, '0');
+}
+
 async function fetchYouTube(videoId) {
   const result = {
     type: 'youtube', videoId, title: '', description: '', channel: '',
+    duration: '', views: '', subtitles: '', subtitlesTimed: [],
     url: 'https://www.youtube.com/watch?v=' + videoId
   };
+
   try {
     const oe = await fetch('https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=' + videoId + '&format=json');
     if (oe.ok) {
@@ -344,15 +414,25 @@ async function fetchYouTube(videoId) {
       result.channel = j.author_name || '';
     }
   } catch (e) {}
+
   try {
-    const r = await fetch('https://www.youtube.com/watch?v=' + videoId, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ru,en;q=0.9' }
+    const pageRes = await fetch('https://www.youtube.com/watch?v=' + videoId, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'ru,en;q=0.9'
+      }
     });
-    const html = await r.text();
+    const html = await pageRes.text();
     let m = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
     if (m) result.description = m[1];
     m = html.match(/"viewCount"\s*:\s*"(\d+)"/);
     if (m) result.views = m[1];
+    m = html.match(/"ownerChannelName"\s*:\s*"([^"]+)"/);
+    if (m && !result.channel) result.channel = m[1];
+    m = html.match(/"lengthSeconds"\s*:\s*"(\d+)"/);
+    if (m) result.duration = formatTimecode(parseInt(m[1], 10));
+
+    // Субтитры
     m = html.match(/"captionTracks"\s*:\s*(\[[\s\S]*?\])/);
     if (m) {
       try {
@@ -361,17 +441,121 @@ async function fetchYouTube(videoId) {
                  || tracks.find(t => t.languageCode && t.languageCode.startsWith('en'))
                  || tracks[0];
         if (track && track.baseUrl) {
-          const c = await fetch(track.baseUrl);
-          const xml = await c.text();
-          const lines = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)].map(x =>
-            x[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/\n/g,' ')
-          );
-          result.subtitles = lines.join(' ').slice(0, 8000);
+          const capRes = await fetch(track.baseUrl);
+          const capXml = await capRes.text();
+
+          // Парсим с таймкодами
+          const matches = [...capXml.matchAll(/<text[^>]*start="([\d.]+)"[^>]*?(?:dur="([\d.]+)")?[^>]*>([\s\S]*?)<\/text>/g)];
+          const timed = matches.map(x => ({
+            start: parseFloat(x[1]),
+            time: formatTimecode(parseFloat(x[1])),
+            text: x[3].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+              .replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\n/g,' ').trim()
+          })).filter(x => x.text);
+
+          if (timed.length) {
+            // Разбиваем на 30-секундные блоки
+            const blocks = [];
+            let cur = { time: timed[0].time, start: timed[0].start, text: '' };
+            timed.forEach(item => {
+              if (item.start - cur.start > 30) {
+                if (cur.text.trim()) blocks.push(cur);
+                cur = { time: item.time, start: item.start, text: item.text };
+              } else {
+                cur.text += ' ' + item.text;
+              }
+            });
+            if (cur.text.trim()) blocks.push(cur);
+
+            result.subtitlesTimed = blocks.slice(0, 100).map(b => ({
+              time: b.time,
+              text: b.text.trim().slice(0, 300)
+            }));
+
+            result.subtitles = timed.map(x => x.text).join(' ').slice(0, 8000);
+          }
         }
       } catch (e) {}
     }
   } catch (e) {}
   return result;
+}
+
+async function fetchOembed(url) {
+  const tests = [
+    { re: /vk\.com\/video/, api: 'https://vk.com/oembed?url=' + encodeURIComponent(url) + '&format=json' },
+    { re: /rutube\.ru\/video/, api: 'https://rutube.ru/api/oembed/?url=' + encodeURIComponent(url) + '&format=json' },
+    { re: /vimeo\.com\/\d+/, api: 'https://vimeo.com/api/oembed.json?url=' + encodeURIComponent(url) }
+  ];
+  for (const s of tests) {
+    if (s.re.test(url)) {
+      try {
+        const r = await fetch(s.api);
+        if (r.ok) return await r.json();
+      } catch (e) {}
+    }
+  }
+  return null;
+}
+
+/* ============================================
+   FETCH URL (главная функция)
+   ============================================ */
+async function fetchUrlContent(cleanUrl, maxLength) {
+  maxLength = maxLength || 12000;
+
+  // YouTube
+  const ytId = youtubeVideoId(cleanUrl);
+  if (ytId) {
+    const yt = await fetchYouTube(ytId);
+    return {
+      ok: true, type: 'video', source: 'youtube', url: cleanUrl,
+      title: yt.title, description: yt.description, channel: yt.channel,
+      duration: yt.duration, views: yt.views,
+      subtitles: yt.subtitles || '',
+      subtitlesTimed: yt.subtitlesTimed || [],
+      hasSubtitles: !!yt.subtitles
+    };
+  }
+
+  // VK / Rutube / Vimeo
+  const oe = await fetchOembed(cleanUrl);
+  if (oe) {
+    return {
+      ok: true, type: 'video', source: 'oembed', url: cleanUrl,
+      title: oe.title || '', description: oe.description || '',
+      channel: oe.author_name || '', thumbnail: oe.thumbnail_url || ''
+    };
+  }
+
+  // Обычная страница
+  const r = await fetch(cleanUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; NovaBot/1.0; +https://nova-browser.onrender.com)',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'ru,en;q=0.9'
+    },
+    redirect: 'follow'
+  });
+  if (!r.ok) return { ok: false, error: 'HTTP ' + r.status, url: cleanUrl };
+
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('text/html') && !ct.includes('text/plain')) {
+    return { ok: true, type: 'file', url: cleanUrl, contentType: ct, message: 'Не HTML' };
+  }
+
+  const html = await r.text();
+  const title = extractTitle(html);
+  const description = extractMeta(html, 'description') || extractMeta(html, 'og:description');
+  const fullText = htmlToText(html);
+
+  return {
+    ok: true, type: 'page', url: cleanUrl, title, description,
+    text: fullText.slice(0, maxLength),
+    fullLength: fullText.length,
+    truncated: fullText.length > maxLength,
+    summary: extractiveSummary(fullText, 5)
+  };
 }
 
 /* ============================================
@@ -387,20 +571,21 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/health') {
     return send(res, 200, {
       ok: true,
-      version: '2.0.0',
+      version: '3.0.0',
       engines: {
         serper1: !!SERPER_KEY_1,
         serper2: !!SERPER_KEY_2,
-        tavily: !!TAVILY_KEY
+        tavily:  !!TAVILY_KEY
       },
       hasAuth: !!(process.env.SITE_USER && process.env.SITE_PASS),
       hasApiToken: !!process.env.API_TOKEN,
       chatclaud: process.env.CHATCLAUD_URL || 'https://chatclaud.onrender.com',
+      cacheSize: cache.size,
       time: new Date().toISOString()
     });
   }
 
-  /* Все /api/* — требуют токен или Basic Auth */
+  /* Все /api/* — токен или Basic Auth */
   if (pathname.startsWith('/api/')) {
     if (!checkApiAuth(req)) return requireAuth(res);
 
@@ -427,40 +612,177 @@ const server = http.createServer(async (req, res) => {
         if (!url) return send(res, 400, { error: 'url required' });
         if (!isSafeUrl(url)) return send(res, 400, { error: 'unsafe url' });
 
-        const ytId = youtubeVideoId(url);
-        if (ytId) {
-          const yt = await fetchYouTube(ytId);
-          return send(res, 200, {
-            ok: true, type: 'video', source: 'youtube',
-            url, title: yt.title, description: yt.description,
-            channel: yt.channel, subtitles: yt.subtitles,
-            hasSubtitles: !!yt.subtitles
-          });
-        }
+        const cacheKey = 'fetch:' + url;
+        const cached = cacheGet(cacheKey, 'fetch');
+        if (cached) return send(res, 200, cached);
 
-        const r = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; NovaBot/1.0)',
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'ru,en;q=0.9'
-          },
-          redirect: 'follow'
+        const result = await fetchUrlContent(url);
+        if (result && result.ok) cacheSet(cacheKey, result);
+        return send(res, 200, result);
+      } catch (e) {
+        return send(res, 500, { error: e.message });
+      }
+    }
+
+    /* /api/multi-fetch — читать несколько URL параллельно */
+    if (pathname === '/api/multi-fetch' && req.method === 'POST') {
+      try {
+        const body = await readBody(req);
+        const urls = Array.isArray(body.urls) ? body.urls.slice(0, 10) : [];
+        if (!urls.length) return send(res, 400, { error: 'urls required' });
+
+        const tasks = urls.map(async (rawUrl) => {
+          const url = String(rawUrl).trim();
+          if (!isSafeUrl(url)) return { url, ok: false, error: 'unsafe' };
+          const cacheKey = 'fetch:' + url;
+          const cached = cacheGet(cacheKey, 'fetch');
+          if (cached) return cached;
+          try {
+            const result = await fetchUrlContent(url);
+            if (result && result.ok) cacheSet(cacheKey, result);
+            return result;
+          } catch (e) {
+            return { url, ok: false, error: e.message };
+          }
         });
-        if (!r.ok) return send(res, 502, { error: 'HTTP ' + r.status });
 
-        const ct = r.headers.get('content-type') || '';
-        if (!ct.includes('text/html') && !ct.includes('text/plain')) {
-          return send(res, 200, { ok: true, type: 'file', contentType: ct });
-        }
-        const html = await r.text();
-        const title = extractTitle(html);
-        const text = htmlToText(html);
+        const results = await Promise.all(tasks);
         return send(res, 200, {
-          ok: true, type: 'page', url, title,
-          text: text.slice(0, 12000),
-          fullLength: text.length,
-          truncated: text.length > 12000
+          ok: true,
+          count: results.length,
+          success: results.filter(r => r && r.ok).length,
+          results: results
         });
+      } catch (e) {
+        return send(res, 500, { error: e.message });
+      }
+    }
+
+    /* /api/summarize — сжатие страницы или текста */
+    if (pathname === '/api/summarize' && req.method === 'POST') {
+      try {
+        const body = await readBody(req);
+        const url = (body.url || '').trim();
+        const text = (body.text || '').trim();
+        const maxSentences = Math.min(20, Math.max(3, parseInt(body.maxSentences, 10) || 6));
+
+        if (!url && !text) return send(res, 400, { error: 'url or text required' });
+
+        // Если URL — сначала читаем
+        if (url) {
+          if (!isSafeUrl(url)) return send(res, 400, { error: 'unsafe url' });
+          const cacheKey = 'summarize:' + url + ':' + maxSentences;
+          const cached = cacheGet(cacheKey, 'summarize');
+          if (cached) return send(res, 200, cached);
+
+          const page = await fetchUrlContent(url);
+          if (!page || !page.ok) return send(res, 502, { error: 'fetch failed' });
+
+          if (page.type === 'video' && page.subtitles) {
+            const summary = extractiveSummary(page.subtitles, maxSentences);
+            const result = {
+              ok: true,
+              type: 'video',
+              url,
+              title: page.title,
+              channel: page.channel,
+              summary,
+              timed: page.subtitlesTimed || []
+            };
+            cacheSet(cacheKey, result);
+            return send(res, 200, result);
+          }
+
+          if (page.type === 'page' && page.text) {
+            const summary = extractiveSummary(page.text, maxSentences);
+            const result = {
+              ok: true,
+              type: 'page',
+              url,
+              title: page.title,
+              summary,
+              keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6)
+            };
+            cacheSet(cacheKey, result);
+            return send(res, 200, result);
+          }
+
+          return send(res, 200, { ok: true, type: page.type, url, summary: page.description || page.title || '' });
+        }
+
+        // Если просто текст
+        const summary = extractiveSummary(text, maxSentences);
+        return send(res, 200, {
+          ok: true,
+          type: 'text',
+          summary,
+          keyPoints: summary.split(/(?<=[.!?…])\s+/).filter(s => s.length > 20).slice(0, 6)
+        });
+      } catch (e) {
+        return send(res, 500, { error: e.message });
+      }
+    }
+
+    /* /api/related — похожие запросы */
+    if (pathname === '/api/related' && req.method === 'POST') {
+      try {
+        const body = await readBody(req);
+        const q = (body.q || '').trim();
+        if (!q) return send(res, 400, { error: 'q required' });
+
+        const cacheKey = 'related:' + q.toLowerCase();
+        const cached = cacheGet(cacheKey, 'related');
+        if (cached) return send(res, 200, cached);
+
+        // Serper даёт relatedSearches в organic
+        const data = await serperSearch(SERPER_KEY_1, q, 'search');
+        const related = [];
+        if (data) {
+          if (Array.isArray(data.relatedSearches)) {
+            data.relatedSearches.forEach(r => {
+              if (r.query) related.push(r.query);
+            });
+          }
+          if (data.peopleAlsoAsk) {
+            data.peopleAlsoAsk.forEach(r => {
+              if (r.question) related.push(r.question);
+            });
+          }
+        }
+
+        const result = {
+          ok: true,
+          query: q,
+          related: related.slice(0, 10)
+        };
+        cacheSet(cacheKey, result);
+        return send(res, 200, result);
+      } catch (e) {
+        return send(res, 500, { error: e.message });
+      }
+    }
+
+    /* /api/trending — тренды */
+    if (pathname === '/api/trending' && req.method === 'GET') {
+      try {
+        const region = (u.searchParams.get('region') || 'ru').toLowerCase();
+        const cacheKey = 'trending:' + region;
+        const cached = cacheGet(cacheKey, 'trending');
+        if (cached) return send(res, 200, cached);
+
+        // Serper /news по общей теме
+        const data = await serperSearch(SERPER_KEY_1, region === 'ru' ? 'новости сегодня' : 'top news today', 'news', region, region);
+        const items = (data && data.news) || [];
+        const trends = items.slice(0, 10).map(n => ({
+          title: n.title || '',
+          source: n.source || '',
+          date: n.date || '',
+          link: n.link || ''
+        }));
+
+        const result = { ok: true, region, count: trends.length, trends };
+        cacheSet(cacheKey, result);
+        return send(res, 200, result);
       } catch (e) {
         return send(res, 500, { error: e.message });
       }
@@ -486,7 +808,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: 'not found' });
   }
 
-  /* Статика — Basic Auth */
+  /* Статика */
   if (!checkBasicAuth(req)) return requireAuth(res);
 
   let filePath = safeJoin(ROOT, pathname === '/' ? '/public/index.html' : pathname);
@@ -508,7 +830,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Nova Browser v2.0 on port', PORT);
+  console.log('Nova Browser v3.0 on port', PORT);
   console.log('Serper #1:', SERPER_KEY_1 ? 'OK' : 'MISSING');
   console.log('Serper #2:', SERPER_KEY_2 ? 'OK' : 'MISSING');
   console.log('Tavily:   ', TAVILY_KEY ? 'OK' : 'MISSING');
